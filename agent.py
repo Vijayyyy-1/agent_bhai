@@ -1,5 +1,5 @@
 """
-agent-git: A CLI tool that uses MCP + Local/Cloud LLMs to automate git workflows.
+agent-gitv1: A CLI tool that uses MCP + Local/Cloud LLMs to automate git workflows.
 """
 
 import asyncio
@@ -555,16 +555,20 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int)
 # ─────────────────────────────────────────────
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="agent-git")
+@click.version_option(version="0.1.1", prog_name="agent-gitv1")
 def cli():
     """
-    \b
-    ╔═══════════════════════════════════════════╗
-    ║  agent-git  🤖  MCP + Multi-LLM Commits  ║
-    ╚═══════════════════════════════════════════╝
+    agent-gitv1: MCP + Multi-LLM Git Assistant
 
     Automate your Git workflow with AI-generated commit messages.
-    Supports OpenAI, Gemini, and Local Ollama models!
+    Supports OpenAI, Gemini, and local Ollama models.
+
+    Available commands:
+      config  Configure AI provider and model
+      commit  Stage changes and create an AI-assisted commit
+      push    Push committed changes to remote
+
+    Run `agent <command> --help` for command-specific options.
     """
     pass
 

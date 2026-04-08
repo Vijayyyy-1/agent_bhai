@@ -1,4 +1,4 @@
-# agent-git 🤖
+# agent-gitv1 🤖
 
 > **AI-powered Git CLI** — Uses [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) + Google Gemini to automatically generate professional commit messages from your diff.
 
