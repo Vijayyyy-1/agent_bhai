@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-git"
+version = "0.1.0"
+description = "AI-powered Git CLI using MCP + Gemini to auto-generate commit messages"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Vijay", email = "you@example.com" }
+]
+keywords = ["git", "mcp", "gemini", "ai", "cli", "automation"]
+
+dependencies = [
+  "click>=8.1",
+  "mcp[cli]>=1.0.0",
+  "google-genai>=0.8.0",
+  "openai>=1.14.0",
+  "requests>=2.31.0",
+]
+
+[project.scripts]
+# This is the magic line:
+# Typing `agent` in terminal calls the `main()` function in agent.py
+agent = "agent:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.hatch.build]
+include = [
+  "agent.py",
+]
