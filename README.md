@@ -77,10 +77,17 @@ agent commit
 # Specify a repo path:
 agent commit --repo /path/to/repo
 
+# Generate multiple suggestions (pick one or type your own):
+agent commit --suggestions 3
+
 # Verbose mode (shows diff preview + available MCP tools):
 agent commit --verbose
 agent commit -v
 ```
+
+`agent commit` is now history-aware:
+- It uses recent commit messages from your repo to align tone/style.
+- It includes changed file names in the LLM prompt for better scoped messages.
 
 ### `agent push` — Push to remote
 
