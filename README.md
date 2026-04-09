@@ -1,158 +1,133 @@
-# agent-gitv1 🤖
+# agent-gitv1
 
-> **AI-powered Git CLI** — Uses [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) + Google Gemini to automatically generate professional commit messages from your diff.
+AI-powered Git CLI that uses Model Context Protocol (MCP) plus your configured LLM provider to automate commit workflows.
 
----
+Supported providers:
+- Google Gemini
+- OpenAI
+- Ollama (local or same-network)
 
-## How It Works
+## Features
 
-```
-Your Code Changes
-      │
-      ▼
-[MCP Client] ──stdio──► [mcp-server-git]
-      │                        │
-      │◄── git diff ───────────┘
-      │
-      ▼
-[Gemini AI] ──► Generate commit message
-      │
-      ▼
-[MCP Client] ──► git add . ──► git commit
-```
-
----
+- `agent config` to set provider and model
+- Smart staging with auto-grouping (UI/backend/config/etc.)
+- `agent commit` to generate commit messages from git diff
+- Multiple commit suggestions (`--suggestions`)
+- Repo-aware style learning from last ~20 commit subjects
+- `agent explain` for change/intent/risk summaries
+- Ollama model auto-detection on local network (`/24`, port `11434`)
+- `agent push` to push to remote
 
 ## Prerequisites
 
-| Tool | Install |
-|------|---------|
-| Python ≥ 3.10 | [python.org](https://python.org) |
-| `uvx` (uv tool runner) | `pip install uv` |
-| `mcp-server-git` | Auto-fetched by `uvx` |
-| Gemini API Key | [aistudio.google.com](https://aistudio.google.com) |
-
----
+- Python 3.10+
+- `uvx` (`pip install uv`)
+- Git
+- Provider credentials (Gemini/OpenAI) or running Ollama server
 
 ## Installation
 
 ```bash
-# 1. Clone / navigate to the project
 cd "d:\Vijay Projects\Agent_bhai"
-
-# 2. Install in editable mode (creates the `agent` command globally)
 pip install -e .
-
-# 3. Set your Gemini API key
-set GEMINI_API_KEY=your_gemini_api_key_here     # Windows CMD
-$env:GEMINI_API_KEY="your_key"                  # Windows PowerShell
-export GEMINI_API_KEY=your_gemini_api_key_here  # Linux / Mac
 ```
 
----
+After install, use command:
 
-## Usage
+```bash
+agent --help
+```
 
-### `agent config` — Configure LLM Provider (Start Here!)
+## Configuration
 
-Run this to configure OpenAI, Google Gemini, or Ollama. 
+Start with:
 
 ```bash
 agent config
 ```
 
-What you can configure:
-- **Google Gemini**: Uses your API key and a model like `gemini-2.0-flash`.
-- **OpenAI (ChatGPT)**: Uses your API key and a model like `gpt-4o-mini`.
-- **Ollama (Local/Network)**: Provide the base URL (e.g. `http://localhost:11434` or `http://192.168.1.50:11434`). The CLI will automatically fetch your downloaded models and let you choose one!
+Provider notes:
+- Gemini: use `GEMINI_API_KEY` or save key in config
+- OpenAI: use `OPENAI_API_KEY` or save key in config
+- Ollama: can auto-detect servers like `http://192.168.1.35:11434`
 
----
+## Commands
 
-### `agent commit` — Stage + AI commit message + commit
+### `agent --help`
+Shows all available commands and options.
+
+### `agent config`
+Configure provider and model.
+
+### `agent commit`
+Smart-stage changes, generate repo-aware suggestions, choose messages, and commit.
+
+Examples:
 
 ```bash
-# In any git repo:
 agent commit
-
-# Specify a repo path:
 agent commit --repo /path/to/repo
-
-# Generate multiple suggestions (pick one or type your own):
 agent commit --suggestions 3
-
-# Verbose mode (shows diff preview + available MCP tools):
+agent commit --no-smart-stage
 agent commit --verbose
-agent commit -v
 ```
 
-`agent commit` is now history-aware:
-- It uses recent commit messages from your repo to align tone/style.
-- It includes changed file names in the LLM prompt for better scoped messages.
+When smart staging is enabled (default), the CLI detects logical change groups and asks if it should create multiple commits.
 
-### `agent push` — Push to remote
+### `agent explain`
+Explain current changes with:
+- what changed
+- why it likely changed
+- risk areas
+- files impacted
+
+Example:
+
+```bash
+agent explain
+agent explain --repo /path/to/repo
+```
+
+### `agent push`
+Push commits to remote.
+
+Examples:
 
 ```bash
 agent push
 agent push --remote origin --branch main
 ```
 
-### Help
-
-```bash
-agent --help
-agent config --help
-agent commit --help
-agent push --help
-```
-
----
-
-## Example Session
-
-```
-🗂  Repository: D:\my-project
-
-🔌 Connecting to mcp-server-git...
-✅ MCP session initialized.
-
-📂 Fetching git diff (unstaged changes)...
-   Diff captured (1240 chars).
-
-🤖 Generating commit message with Gemini...
-
-💬 Commit Message: feat(auth): add JWT token refresh endpoint
-
-Proceed with git add + commit? [Y/n]: y
-
-📦 Staging all changes (git add .)...
-   Files staged.
-
-✍️  Committing...
-   [main a3f12bc] feat(auth): add JWT token refresh endpoint
-
-🚀 Done! Changes committed successfully.
-```
-
----
-
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GEMINI_API_KEY` | ✅ Yes | Your Google Gemini API key |
+- `GEMINI_API_KEY` (Gemini)
+- `OPENAI_API_KEY` (OpenAI)
 
----
+## Publish to PyPI
+
+1. Bump version in `pyproject.toml` and `agent.py`
+2. Build and validate:
+
+```bash
+python -m pip install --upgrade build twine
+python -m build
+python -m twine check dist/*
+```
+
+3. Upload:
+
+```bash
+python -m twine upload dist/*
+```
 
 ## Project Structure
 
-```
+```text
 Agent_bhai/
-├── agent.py          # Main CLI + MCP client logic
-├── pyproject.toml    # Packaging + entry point config
-└── README.md         # This file
+|- agent.py
+|- pyproject.toml
+|- README.md
 ```
-
----
 
 ## License
 
