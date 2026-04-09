@@ -8,6 +8,9 @@ import os
 import json
 import re
 import subprocess
+import socket
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import click
 from mcp import ClientSession, StdioServerParameters
@@ -24,6 +27,7 @@ MAX_DIFF_CHARS_FOR_LLM = 28000
 MAX_FILES_FOR_LLM_DIFF = 40
 MAX_CHARS_PER_FILE_SECTION = 1400
 MAX_HISTORY_COMMITS = 12
+STYLE_HISTORY_COMMITS = 20
 MAX_HISTORY_CHARS = 2400
 
 COMMIT_SYSTEM_PROMPT = """
@@ -44,6 +48,17 @@ Examples:
   refactor(api): simplify error handling middleware
 """
 
+EXPLAIN_SYSTEM_PROMPT = """
+You are a senior engineer explaining a code diff.
+Return plain text with exactly these sections:
+1) What Changed
+2) Why It Likely Changed
+3) Risk Areas
+4) Files Impacted
+
+Be concrete and concise. Do not use markdown tables.
+"""
+
 COMMIT_TYPE_PATTERN = r"(?:feat|fix|docs|style|refactor|test|chore|ci|perf)"
 COMMIT_MESSAGE_PATTERN = re.compile(
     rf"^{COMMIT_TYPE_PATTERN}(?:\([^)]+\))?: .+"
@@ -62,6 +77,19 @@ def save_config(config: dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
+def run_git(repo_path: str, args: list[str]) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo_path,
+        text=False,
+        capture_output=True,
+    )
+    stdout = (result.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        raise click.ClickException(stderr.strip() or f"git {' '.join(args)} failed.")
+    return stdout
+
 
 # ─────────────────────────────────────────────
 # AI Providers
@@ -76,6 +104,56 @@ def get_ollama_models(base_url: str):
         return [m["name"] for m in resp.json().get("models", [])]
     except Exception:
         return []
+
+def get_local_ipv4() -> str:
+    """
+    Best-effort local IPv4 detection for subnet discovery.
+    Uses UDP connect trick (no packet sent) to determine outbound interface IP.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return ""
+
+def discover_ollama_servers(port: int = 11434, timeout: float = 0.6) -> list[tuple[str, list[str]]]:
+    """
+    Discover Ollama servers in the same /24 subnet plus localhost.
+    Returns list of (base_url, models) for reachable Ollama instances.
+    """
+    local_ip = get_local_ipv4()
+    candidate_urls = {
+        f"http://localhost:{port}",
+        f"http://127.0.0.1:{port}",
+    }
+
+    if local_ip and "." in local_ip:
+        subnet = ".".join(local_ip.split(".")[:3])
+        for i in range(1, 255):
+            candidate_urls.add(f"http://{subnet}.{i}:{port}")
+
+    found: list[tuple[str, list[str]]] = []
+
+    def probe(url: str):
+        models = get_ollama_models(url)
+        if models:
+            return (url, models)
+        return None
+
+    with ThreadPoolExecutor(max_workers=48) as pool:
+        futures = [pool.submit(probe, url) for url in sorted(candidate_urls)]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                found.append(result)
+
+    # Keep localhost entries first, then sort by URL.
+    localhost_first = sorted(
+        found,
+        key=lambda item: (0 if ("localhost" in item[0] or "127.0.0.1" in item[0]) else 1, item[0]),
+    )
+    return localhost_first
 
 def generate_with_gemini(diff: str, config: dict) -> str:
     from google import genai
@@ -205,10 +283,50 @@ def get_recent_commit_history(repo_path: str, max_commits: int = MAX_HISTORY_COM
         return output[:MAX_HISTORY_CHARS] + "\n... [history truncated]"
     return output
 
+def get_recent_commit_subjects(repo_path: str, max_commits: int = STYLE_HISTORY_COMMITS) -> list[str]:
+    try:
+        output = run_git(repo_path, ["log", f"-n{max_commits}", "--pretty=format:%s"]).strip()
+    except Exception:
+        return []
+    if not output:
+        return []
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+def build_repo_style_profile(repo_path: str) -> str:
+    subjects = get_recent_commit_subjects(repo_path, STYLE_HISTORY_COMMITS)
+    if not subjects:
+        return "No commit history style available."
+
+    prefixes = []
+    with_scope = 0
+    lengths = []
+    for msg in subjects:
+        lengths.append(len(msg))
+        m = re.match(rf"^({COMMIT_TYPE_PATTERN})(\([^)]+\))?:", msg)
+        if m:
+            prefixes.append(m.group(1).lower())
+            if m.group(2):
+                with_scope += 1
+
+    prefix_counts = Counter(prefixes)
+    top_prefixes = ", ".join(f"{k}({v})" for k, v in prefix_counts.most_common(3)) or "none detected"
+    avg_len = int(sum(lengths) / len(lengths))
+    scope_ratio = int((with_scope / len(subjects)) * 100)
+
+    return (
+        "Repository commit style profile:\n"
+        f"- Recent commits analyzed: {len(subjects)}\n"
+        f"- Common prefixes: {top_prefixes}\n"
+        f"- Average subject length: {avg_len} chars\n"
+        f"- Scope usage: {scope_ratio}% of commits\n"
+        f"- Examples:\n  - " + "\n  - ".join(subjects[:5])
+    )
+
 def build_commit_user_prompt(
     diff_text: str,
     history_text: str,
     changed_files: list[str],
+    style_profile: str,
 ) -> str:
     files_block = "\n".join(f"- {name}" for name in changed_files) if changed_files else "- (not detected)"
     history_block = history_text if history_text else "(No recent commits available)"
@@ -216,6 +334,8 @@ def build_commit_user_prompt(
         "Write commit message suggestion(s) for the following change.\n\n"
         "Recent commit messages from this repository (for style/context):\n"
         f"{history_block}\n\n"
+        "Derived style guidance from repository history:\n"
+        f"{style_profile}\n\n"
         "Changed files:\n"
         f"{files_block}\n\n"
         "Git diff:\n"
@@ -258,19 +378,24 @@ def parse_commit_suggestions(raw_text: str, expected: int) -> list[str]:
                 break
     return suggestions
 
-def generate_commit_suggestions(
-    diff_text: str,
-    repo_path: str,
-    suggestions: int,
-) -> list[str]:
-    config = load_config()
-    provider = config.get("provider", "gemini") # Default fallback
+def choose_commit_message(suggestions: list[str], title: str = "Suggested Commit Messages") -> str:
+    click.echo(click.style(f"\n💬 {title}:", fg="green"))
+    for idx, suggestion in enumerate(suggestions, start=1):
+        click.echo(click.style(f"   {idx}. {suggestion}", fg="bright_white"))
 
-    history_text = get_recent_commit_history(repo_path)
-    changed_files = extract_changed_files(diff_text)
-    user_prompt = build_commit_user_prompt(diff_text, history_text, changed_files)
-    system_prompt = build_commit_system_prompt(suggestions)
+    selection = click.prompt(
+        click.style("\nSelect message number or type a custom message", fg="yellow"),
+        default="1",
+        type=str,
+    ).strip()
+    if selection.isdigit() and 1 <= int(selection) <= len(suggestions):
+        return suggestions[int(selection) - 1]
+    if selection:
+        return selection
+    return suggestions[0]
 
+def llm_generate_text(system_prompt: str, user_prompt: str, config: dict, temperature: float = 0.2) -> str:
+    provider = config.get("provider", "gemini")
     if provider == "gemini":
         from google import genai
         from google.genai import types
@@ -283,11 +408,12 @@ def generate_commit_suggestions(
             contents=user_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
-                temperature=0.2,
+                temperature=temperature,
             ),
         )
-        raw_text = (response.text or "").strip()
-    elif provider in ("openai", "ollama"):
+        return (response.text or "").strip()
+
+    if provider in ("openai", "ollama"):
         from openai import OpenAI
         if provider == "openai":
             api_key = config.get("api_key") or os.environ.get("OPENAI_API_KEY")
@@ -307,15 +433,29 @@ def generate_commit_suggestions(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.2,
+                temperature=temperature,
             )
+            return (response.choices[0].message.content or "").strip()
         except Exception as e:
             if provider == "ollama":
                 raise click.ClickException(f"Ollama generation failed: {e}\nIs Ollama running at {config.get('base_url', 'http://localhost:11434')}?")
             raise
-        raw_text = (response.choices[0].message.content or "").strip()
-    else:
-        raise click.ClickException(f"Unknown provider '{provider}'. Run 'agent config'.")
+
+    raise click.ClickException(f"Unknown provider '{provider}'. Run 'agent config'.")
+
+def generate_commit_suggestions(
+    diff_text: str,
+    repo_path: str,
+    suggestions: int,
+) -> list[str]:
+    config = load_config()
+
+    history_text = get_recent_commit_history(repo_path)
+    style_profile = build_repo_style_profile(repo_path)
+    changed_files = extract_changed_files(diff_text)
+    user_prompt = build_commit_user_prompt(diff_text, history_text, changed_files, style_profile)
+    system_prompt = build_commit_system_prompt(suggestions)
+    raw_text = llm_generate_text(system_prompt, user_prompt, config=config, temperature=0.2)
 
     parsed = parse_commit_suggestions(raw_text, suggestions)
     if not parsed:
@@ -389,12 +529,74 @@ def build_llm_diff_payload(diff_text: str):
 
     return payload, True
 
+def list_changed_files(repo_path: str) -> list[str]:
+    output = run_git(repo_path, ["status", "--porcelain"])
+    files = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path and path not in files:
+            files.append(path)
+    return files
+
+def classify_change_group(path: str) -> str:
+    p = path.replace("\\", "/").lower()
+    base = os.path.basename(p)
+
+    config_names = {
+        ".env", ".env.example", "dockerfile", "docker-compose.yml",
+        "package.json", "package-lock.json", "pyproject.toml", "requirements.txt",
+        "tsconfig.json", "vite.config.ts", "webpack.config.js",
+    }
+    if base in config_names or p.endswith((".yml", ".yaml", ".toml", ".ini", ".cfg")):
+        return "config updates"
+
+    if any(token in p for token in ("ui/", "frontend/", "web/", "client/", "components/", "pages/", "styles/")):
+        return "ui changes"
+    if p.endswith((".tsx", ".jsx", ".css", ".scss", ".sass", ".html", ".vue")):
+        return "ui changes"
+
+    if any(token in p for token in ("api/", "backend/", "server/", "services/", "controllers/", "models/", "db/")):
+        return "backend logic"
+    if p.endswith((".py", ".go", ".java", ".kt", ".rb", ".php", ".cs", ".rs")):
+        return "backend logic"
+
+    if p.startswith("docs/") or base.endswith(".md"):
+        return "docs and content"
+
+    return "other changes"
+
+def build_change_groups(files: list[str]) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for path in files:
+        group = classify_change_group(path)
+        groups.setdefault(group, []).append(path)
+    return groups
+
+def build_files_diff(repo_path: str, files: list[str]) -> str:
+    if not files:
+        return ""
+    return run_git(repo_path, ["diff", DEFAULT_DIFF_TARGET, "--", *files])
+
+def build_explain_user_prompt(diff_text: str, changed_files: list[str]) -> str:
+    files_block = "\n".join(f"- {name}" for name in changed_files) if changed_files else "- (not detected)"
+    return (
+        "Explain this repository diff.\n\n"
+        "Changed files:\n"
+        f"{files_block}\n\n"
+        "Diff:\n"
+        f"{diff_text}\n"
+    )
+
 
 # ─────────────────────────────────────────────
 # MCP Core Logic
 # ─────────────────────────────────────────────
 
-async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int):
+async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int, smart_stage: bool):
     """
     Full MCP lifecycle:
       1. Initialize MCP session with mcp-server-git
@@ -402,6 +604,61 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int)
       3. Generate commit message via selected AI Provider
       4. Call git_add then git_commit via MCP
     """
+    if smart_stage:
+        changed_files = list_changed_files(repo_path)
+        if changed_files:
+            groups = build_change_groups(changed_files)
+            if len(groups) > 1:
+                click.echo(click.style("\n🧠 Smart staging detected logical groups:", fg="cyan"))
+                for idx, (name, files) in enumerate(groups.items(), start=1):
+                    click.echo(click.style(f"   {idx}. {name} ({len(files)} files)", fg="bright_white"))
+                    if verbose:
+                        for file_path in files[:5]:
+                            click.echo(click.style(f"      - {file_path}", fg="bright_black"))
+                        if len(files) > 5:
+                            click.echo(click.style(f"      ... +{len(files)-5} more", fg="bright_black"))
+
+                if click.confirm(click.style(f"\nCreate {len(groups)} commits from these groups?", fg="yellow"), default=True):
+                    for group_name, files in groups.items():
+                        group_diff = build_files_diff(repo_path, files)
+                        if not group_diff.strip():
+                            continue
+
+                        click.echo(click.style(f"\n📂 Group: {group_name}", fg="cyan"))
+                        llm_diff_payload, was_truncated = build_llm_diff_payload(group_diff)
+                        if was_truncated and verbose:
+                            click.echo(click.style(
+                                f"   Large group diff. Using compact payload ({len(llm_diff_payload)} chars).",
+                                fg="yellow",
+                            ))
+
+                        suggestions = generate_commit_suggestions(
+                            llm_diff_payload,
+                            repo_path,
+                            suggestion_count,
+                        )
+                        commit_message = choose_commit_message(
+                            suggestions,
+                            title=f"Suggested messages for {group_name}",
+                        )
+                        click.echo(click.style(
+                            f"\n✅ Selected Commit Message: {click.style(commit_message, bold=True, fg='bright_white')}",
+                            fg="green"
+                        ))
+                        if not click.confirm(click.style("Commit this group now?", fg="yellow"), default=True):
+                            click.echo(click.style("   Skipped group.", fg="yellow"))
+                            continue
+
+                        run_git(repo_path, ["add", "--", *files])
+                        commit_output = run_git(repo_path, ["commit", "-m", commit_message]).strip()
+                        click.echo(click.style(f"   {commit_output}", fg="green"))
+
+                    click.echo(click.style(
+                        "\n🚀 Done! Smart-staged commits created successfully.",
+                        fg="bright_green", bold=True
+                    ))
+                    return
+
     server_params = StdioServerParameters(
         command="uvx",
         args=["mcp-server-git", "--repository", repo_path],
@@ -481,21 +738,7 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int)
                     fg="yellow",
                 ))
 
-            click.echo(click.style("\n💬 Suggested Commit Messages:", fg="green"))
-            for idx, suggestion in enumerate(suggestions, start=1):
-                click.echo(click.style(f"   {idx}. {suggestion}", fg="bright_white"))
-
-            selection = click.prompt(
-                click.style("\nSelect message number or type a custom message", fg="yellow"),
-                default="1",
-                type=str,
-            ).strip()
-            if selection.isdigit() and 1 <= int(selection) <= len(suggestions):
-                commit_message = suggestions[int(selection) - 1]
-            elif selection:
-                commit_message = selection
-            else:
-                commit_message = suggestions[0]
+            commit_message = choose_commit_message(suggestions)
 
             click.echo(click.style(
                 f"\n✅ Selected Commit Message: {click.style(commit_message, bold=True, fg='bright_white')}",
@@ -555,7 +798,7 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int)
 # ─────────────────────────────────────────────
 
 @click.group()
-@click.version_option(version="0.1.1", prog_name="agent-gitv1")
+@click.version_option(version="0.1.2", prog_name="agent-gitv1")
 def cli():
     """
     agent-gitv1: MCP + Multi-LLM Git Assistant
@@ -565,7 +808,8 @@ def cli():
 
     Available commands:
       config  Configure AI provider and model
-      commit  Stage changes and create an AI-assisted commit
+      commit  Smart-stage changes and create AI-assisted commit(s)
+      explain Explain what changed, why, risks, and impacted files
       push    Push committed changes to remote
 
     Run `agent <command> --help` for command-specific options.
@@ -594,7 +838,33 @@ def config_command():
         config["model"] = click.prompt("Model", default="gpt-4o-mini")
         
     elif provider == "ollama":
-        base_url = click.prompt("Ollama Base URL", default="http://localhost:11434")
+        base_url = "http://localhost:11434"
+
+        if click.confirm("Auto-detect Ollama servers on your local network?", default=True):
+            click.echo("Scanning local network for Ollama servers (this can take a few seconds)...")
+            discovered = discover_ollama_servers()
+            if discovered:
+                click.echo(click.style("\nDetected Ollama Servers:", fg="green"))
+                for i, (url, models) in enumerate(discovered, start=1):
+                    preview = ", ".join(models[:3])
+                    more = f" (+{len(models)-3} more)" if len(models) > 3 else ""
+                    click.echo(f"  {i}. {url}  ->  {preview}{more}")
+
+                choice = click.prompt(
+                    "\nSelect server by number or type custom base URL",
+                    type=str,
+                    default="1",
+                ).strip()
+                if choice.isdigit() and 1 <= int(choice) <= len(discovered):
+                    base_url = discovered[int(choice) - 1][0]
+                elif choice:
+                    base_url = choice
+            else:
+                click.echo(click.style("No Ollama servers auto-detected.", fg="yellow"))
+                base_url = click.prompt("Ollama Base URL", default="http://localhost:11434")
+        else:
+            base_url = click.prompt("Ollama Base URL", default="http://localhost:11434")
+
         config["base_url"] = base_url
         
         click.echo("Fetching available models from Ollama...")
@@ -642,8 +912,14 @@ def config_command():
     show_default=True,
     help="How many AI commit message suggestions to generate.",
 )
-def commit_command(repo: str, verbose: bool, suggestions: int):
-    """Stage, generate a commit message, and commit all changes."""
+@click.option(
+    "--smart-stage/--no-smart-stage",
+    default=True,
+    show_default=True,
+    help="Auto-group changes (ui/backend/config/etc.) and optionally create multiple commits.",
+)
+def commit_command(repo: str, verbose: bool, suggestions: int, smart_stage: bool):
+    """Smart-stage changes, generate AI messages, and create commit(s)."""
     repo_path = os.path.abspath(repo)
 
     if not os.path.isdir(os.path.join(repo_path, ".git")):
@@ -656,12 +932,41 @@ def commit_command(repo: str, verbose: bool, suggestions: int):
     ))
 
     try:
-        asyncio.run(run_agent_commit(repo_path, verbose, suggestions))
+        asyncio.run(run_agent_commit(repo_path, verbose, suggestions, smart_stage))
     except KeyboardInterrupt:
         click.echo(click.style("\n\n⚡ Interrupted by user.", fg="yellow"))
         sys.exit(0)
     except Exception as e:
         raise click.ClickException(str(e))
+
+@cli.command("explain")
+@click.option("--repo", "-r", default=".", show_default=True, help="Path to the git repository.")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Show extra debug information.")
+def explain_command(repo: str, verbose: bool):
+    """Explain current changes: what changed, why, risks, and impacted files."""
+    repo_path = os.path.abspath(repo)
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        raise click.ClickException(f"'{repo_path}' is not a valid git repository (no .git folder found).")
+
+    click.echo(click.style(f"\n🗂  Repository: {repo_path}", fg="bright_cyan", bold=True))
+    click.echo(click.style("🔎 Analyzing repository changes...", fg="cyan"))
+
+    diff_text = run_git(repo_path, ["diff", DEFAULT_DIFF_TARGET])
+    if not diff_text.strip():
+        click.echo(click.style("⚠️  No changes detected to explain.", fg="yellow"))
+        return
+
+    changed_files = list_changed_files(repo_path)
+    payload, truncated = build_llm_diff_payload(diff_text)
+    if truncated and verbose:
+        click.echo(click.style(f"   Large diff detected. Using compacted payload ({len(payload)} chars).", fg="yellow"))
+
+    config = load_config()
+    user_prompt = build_explain_user_prompt(payload, changed_files)
+    explanation = llm_generate_text(EXPLAIN_SYSTEM_PROMPT, user_prompt, config=config, temperature=0.1)
+
+    click.echo(click.style("\n📘 Change Explanation", fg="green", bold=True))
+    click.echo(explanation.strip() or "No explanation generated.")
 
 
 @cli.command("push")
