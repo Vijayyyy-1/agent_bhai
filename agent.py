@@ -9,7 +9,10 @@ import json
 import re
 import subprocess
 import socket
+import threading
+import time
 from collections import Counter
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import click
@@ -76,6 +79,39 @@ def load_config() -> dict:
 def save_config(config: dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
+
+@contextmanager
+def loading_spinner(message: str):
+    """
+    Lightweight terminal spinner for long-running steps.
+    Falls back to a plain message when stdout is not a TTY.
+    """
+    if not sys.stdout.isatty():
+        click.echo(f"{message}...")
+        yield
+        return
+
+    frames = ["[=   ]", "[==  ]", "[=== ]", "[ ===]", "[  ==]", "[   =]", "[  ==]", "[ ===]"]
+    stop_event = threading.Event()
+
+    def _spin():
+        idx = 0
+        while not stop_event.is_set():
+            frame = frames[idx % len(frames)]
+            sys.stdout.write(f"\r{message} {frame}")
+            sys.stdout.flush()
+            idx += 1
+            time.sleep(0.12)
+
+    thread = threading.Thread(target=_spin, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=0.5)
+        sys.stdout.write("\r" + (" " * (len(message) + 12)) + "\r")
+        sys.stdout.flush()
 
 def run_git(repo_path: str, args: list[str]) -> str:
     result = subprocess.run(
@@ -632,11 +668,12 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int,
                                 fg="yellow",
                             ))
 
-                        suggestions = generate_commit_suggestions(
-                            llm_diff_payload,
-                            repo_path,
-                            suggestion_count,
-                        )
+                        with loading_spinner(f"Thinking for {group_name}"):
+                            suggestions = generate_commit_suggestions(
+                                llm_diff_payload,
+                                repo_path,
+                                suggestion_count,
+                            )
                         commit_message = choose_commit_message(
                             suggestions,
                             title=f"Suggested messages for {group_name}",
@@ -727,11 +764,12 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int,
                     fg="yellow"
                 ))
 
-            suggestions = generate_commit_suggestions(
-                llm_diff_payload,
-                repo_path,
-                suggestion_count,
-            )
+            with loading_spinner("Thinking about commit messages"):
+                suggestions = generate_commit_suggestions(
+                    llm_diff_payload,
+                    repo_path,
+                    suggestion_count,
+                )
             if len(suggestions) < suggestion_count and verbose:
                 click.echo(click.style(
                     f"   Provider returned {len(suggestions)} valid suggestion(s).",
@@ -841,8 +879,8 @@ def config_command():
         base_url = "http://localhost:11434"
 
         if click.confirm("Auto-detect Ollama servers on your local network?", default=True):
-            click.echo("Scanning local network for Ollama servers (this can take a few seconds)...")
-            discovered = discover_ollama_servers()
+            with loading_spinner("Scanning local network for Ollama servers"):
+                discovered = discover_ollama_servers()
             if discovered:
                 click.echo(click.style("\nDetected Ollama Servers:", fg="green"))
                 for i, (url, models) in enumerate(discovered, start=1):
@@ -963,7 +1001,8 @@ def explain_command(repo: str, verbose: bool):
 
     config = load_config()
     user_prompt = build_explain_user_prompt(payload, changed_files)
-    explanation = llm_generate_text(EXPLAIN_SYSTEM_PROMPT, user_prompt, config=config, temperature=0.1)
+    with loading_spinner("Analyzing changes"):
+        explanation = llm_generate_text(EXPLAIN_SYSTEM_PROMPT, user_prompt, config=config, temperature=0.1)
 
     click.echo(click.style("\n📘 Change Explanation", fg="green", bold=True))
     click.echo(explanation.strip() or "No explanation generated.")
