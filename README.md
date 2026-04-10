@@ -114,9 +114,12 @@ agent push
 agent push --remote origin --branch main
 ```
 
+When `--branch` is omitted, `agent` auto-detects and pushes your current local branch name.
+
 If push fails, `agent` first uses the LLM to choose evidence depth, then runs diagnosis commands live.
 For divergence/history problems it collects full branch evidence (`fetch`, logs, ahead/behind, merge-base).
 For auth/permission issues it uses a lightweight evidence set to avoid noisy output.
+If the current branch has no upstream, `agent` offers to run `git push --set-upstream` automatically.
 
 ### `agent --help`
 Show all commands and options.

@@ -854,8 +854,7 @@ def collect_push_diagnosis_context_light(repo_path: str, remote: str, branch: st
     try_git_live(["status", "--short", "--branch"], "`git status --short --branch`")
     try_git_live(["remote", "-v"], "`git remote -v`")
     try_git_live(["config", "--get", "credential.helper"], "`git config --get credential.helper`")
-    try_git_live(["config", "--get", "user.name"], "`git config --get user.name`")
-    try_git_live(["config", "--get", "user.email"], "`git config --get user.email`")
+    try_git_live(["config", "--show-origin", "--get-all", "credential.helper"], "`git config --show-origin --get-all credential.helper`")
     return "\n\n".join(snippets)
 
 def route_push_evidence_mode(error_text: str, config: dict) -> str:
@@ -1351,17 +1350,17 @@ def push_command(remote: str, branch: str, repo: str):
     except subprocess.CalledProcessError:
         raise click.ClickException("Failed to check git remotes.")
 
-    click.echo(click.style(
-        f"🚀 Pushing to {remote} {branch or '(current branch)'}...", fg="cyan"
-    ))
-
-    cmd = ["git", "push", remote]
-    if branch:
-        cmd.append(branch)
     try:
         target_branch = branch or get_current_branch(repo_path)
     except Exception:
         target_branch = branch or "(current)"
+
+    click.echo(click.style(
+        f"🚀 Pushing to {remote} {target_branch}...", fg="cyan"
+    ))
+
+    # Always push an explicit target branch to avoid no-upstream failures on new branches.
+    cmd = ["git", "push", remote, target_branch]
 
     try:
         click.echo(click.style(f"Running: {' '.join(cmd)}", fg="bright_black"))
@@ -1370,7 +1369,20 @@ def push_command(remote: str, branch: str, repo: str):
         if returncode == 0:
             click.echo(click.style("\n✅ Push complete!", fg="bright_green", bold=True))
         else:
-            diagnosis = diagnose_push_failure(repo_path, remote, target_branch, f"{stdout}\n{stderr}".strip())
+            error_text = f"{stdout}\n{stderr}".strip()
+
+            if "has no upstream branch" in error_text.lower():
+                click.echo(click.style("\nℹ️  No upstream branch detected.", fg="yellow"))
+                upstream_cmd = ["git", "push", "--set-upstream", remote, target_branch]
+                if click.confirm(click.style(f"Run: {' '.join(upstream_cmd)} ?", fg="yellow"), default=True):
+                    click.echo(click.style(f"Running: {' '.join(upstream_cmd)}", fg="bright_black"))
+                    up_code, up_out, up_err = run_command_live(upstream_cmd, cwd=repo_path)
+                    if up_code == 0:
+                        click.echo(click.style("\n✅ Upstream configured and push complete!", fg="bright_green", bold=True))
+                        return
+                    error_text = f"{up_out}\n{up_err}".strip()
+
+            diagnosis = diagnose_push_failure(repo_path, remote, target_branch, error_text)
             click.echo(click.style("\n🩺 Push Failure Diagnosis", fg="yellow", bold=True))
             click.echo(diagnosis.strip())
             sys.exit(returncode)
