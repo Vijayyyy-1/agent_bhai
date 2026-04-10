@@ -39,7 +39,7 @@ agent push
 - Ollama local-network detection (same `/24`, port `11434`)
 - Loading/thinking spinner during long-running tasks
 - `agent push` with live command output streaming
-- LLM-driven push-failure diagnosis from live git evidence
+- LLM-driven push-failure diagnosis with adaptive live git evidence collection
 
 ## Requirements
 
@@ -114,7 +114,9 @@ agent push
 agent push --remote origin --branch main
 ```
 
-If push fails, `agent` runs diagnosis evidence commands live (`fetch`, local/remote logs, ahead/behind, merge-base, tracking) and asks the LLM for root cause + fix commands.
+If push fails, `agent` first uses the LLM to choose evidence depth, then runs diagnosis commands live.
+For divergence/history problems it collects full branch evidence (`fetch`, logs, ahead/behind, merge-base).
+For auth/permission issues it uses a lightweight evidence set to avoid noisy output.
 
 ### `agent --help`
 Show all commands and options.

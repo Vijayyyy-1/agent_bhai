@@ -76,6 +76,21 @@ Rules:
 - Commands must be valid PowerShell commands and copy-paste ready.
 - Put one command per line.
 - Keep it practical and concise.
+- On Windows auth issues, prefer `git credential-manager github logout`
+  over generic erase commands.
+- Avoid destructive commands unless absolutely necessary.
+"""
+
+PUSH_EVIDENCE_ROUTER_PROMPT = """
+You classify how much git evidence is needed to diagnose a failed push.
+Return exactly one word:
+FULL
+or
+LIGHT
+
+Use FULL for branch divergence/history sync issues (non-fast-forward, fetch first, behind remote, rejected updates).
+Use LIGHT for auth/permission/token/network/remote-url issues where heavy history logs are unnecessary.
+No extra text.
 """
 
 COMMIT_TYPE_PATTERN = r"(?:feat|fix|docs|style|refactor|test|chore|ci|perf)"
@@ -807,7 +822,7 @@ def collect_push_diagnosis_context(repo_path: str, remote: str, branch: str) -> 
         else:
             snippets.append(f"{label}:\n(command failed, exit={code})\n{combined or '(no output)'}")
 
-    # Gather fresh remote state for factual diagnosis.
+    # Default: full diagnostic evidence.
     try_git_live(["fetch", remote, branch], f"`git fetch {remote} {branch}`")
     try_git_live(["status", "--short", "--branch"], "`git status --short --branch`")
     try_git_live(["branch", "-vv"], "`git branch -vv`")
@@ -818,6 +833,45 @@ def collect_push_diagnosis_context(repo_path: str, remote: str, branch: str) -> 
     try_git_live(["log", "--oneline", "-10", f"{remote}/{branch}"], f"`git log --oneline -10 {remote}/{branch}`")
 
     return "\n\n".join(snippets)
+
+def collect_push_diagnosis_context_light(repo_path: str, remote: str, branch: str) -> str:
+    snippets = []
+    snippets.append(f"Repo path: {repo_path}")
+    snippets.append(f"Remote: {remote}")
+    snippets.append(f"Branch: {branch}")
+
+    def try_git_live(args: list[str], label: str):
+        cmd_display = "git " + " ".join(args)
+        click.echo(click.style(f"  [diagnose] Running: {cmd_display}", fg="bright_black"))
+        code, out, err = run_command_live(["git", *args], cwd=repo_path)
+        combined = "\n".join(part for part in [out, err] if part).strip()
+        if code == 0:
+            snippets.append(f"{label}:\n{combined or '(empty)'}")
+        else:
+            snippets.append(f"{label}:\n(command failed, exit={code})\n{combined or '(no output)'}")
+
+    # Lightweight evidence for auth/permission/url/network style issues.
+    try_git_live(["status", "--short", "--branch"], "`git status --short --branch`")
+    try_git_live(["remote", "-v"], "`git remote -v`")
+    try_git_live(["config", "--get", "credential.helper"], "`git config --get credential.helper`")
+    try_git_live(["config", "--get", "user.name"], "`git config --get user.name`")
+    try_git_live(["config", "--get", "user.email"], "`git config --get user.email`")
+    return "\n\n".join(snippets)
+
+def route_push_evidence_mode(error_text: str, config: dict) -> str:
+    prompt = (
+        "Classify this failed push using only the error output below.\n\n"
+        "Error output:\n"
+        f"{error_text}\n"
+    )
+    try:
+        verdict = llm_generate_text(PUSH_EVIDENCE_ROUTER_PROMPT, prompt, config=config, temperature=0.0).strip().upper()
+        if verdict in ("FULL", "LIGHT"):
+            return verdict
+    except Exception:
+        pass
+    # Safe default keeps current strong behavior.
+    return "FULL"
 
 def build_push_failure_user_prompt(
     repo_path: str,
@@ -852,8 +906,12 @@ def diagnose_push_failure(repo_path: str, remote: str, branch: str, error_text: 
         return fallback
 
     try:
-        with loading_spinner("Collecting git evidence"):
-            dynamic_context = collect_push_diagnosis_context(repo_path, remote, branch)
+        mode = route_push_evidence_mode(error_text, config)
+        with loading_spinner(f"Collecting git evidence ({mode.lower()})"):
+            if mode == "LIGHT":
+                dynamic_context = collect_push_diagnosis_context_light(repo_path, remote, branch)
+            else:
+                dynamic_context = collect_push_diagnosis_context(repo_path, remote, branch)
         concise_mode = diagnosis_is_clear(dynamic_context)
         llm_prompt = build_push_failure_user_prompt(
             repo_path,
