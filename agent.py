@@ -62,6 +62,22 @@ Return plain text with exactly these sections:
 Be concrete and concise. Do not use markdown tables.
 """
 
+PUSH_FAILURE_SYSTEM_PROMPT = """
+You are a senior Git assistant. Diagnose a failed `git push`.
+Return plain text with exactly these sections (no markdown):
+1) Why It Failed
+2) Most Likely Fix
+3) Commands To Run
+4) Safety Notes
+
+Rules:
+- Do not use markdown headings, code fences, bullet symbols, or tables.
+- Use simple lines only.
+- Commands must be valid PowerShell commands and copy-paste ready.
+- Put one command per line.
+- Keep it practical and concise.
+"""
+
 COMMIT_TYPE_PATTERN = r"(?:feat|fix|docs|style|refactor|test|chore|ci|perf)"
 COMMIT_MESSAGE_PATTERN = re.compile(
     rf"^{COMMIT_TYPE_PATTERN}(?:\([^)]+\))?: .+"
@@ -125,6 +141,41 @@ def run_git(repo_path: str, args: list[str]) -> str:
     if result.returncode != 0:
         raise click.ClickException(stderr.strip() or f"git {' '.join(args)} failed.")
     return stdout
+
+def run_command_live(cmd: list[str], cwd: str) -> tuple[int, str, str]:
+    """
+    Run a command with live terminal streaming while also capturing output.
+    Returns (returncode, stdout_text, stderr_text).
+    """
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def _reader(stream, collector: list[str], is_err: bool):
+        if stream is None:
+            return
+        for chunk in iter(stream.readline, b""):
+            text = chunk.decode("utf-8", errors="replace")
+            collector.append(text)
+            click.echo(text.rstrip("\n"), err=is_err)
+        stream.close()
+
+    t_out = threading.Thread(target=_reader, args=(process.stdout, stdout_chunks, False), daemon=True)
+    t_err = threading.Thread(target=_reader, args=(process.stderr, stderr_chunks, True), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    returncode = process.wait()
+    t_out.join(timeout=1.0)
+    t_err.join(timeout=1.0)
+
+    return returncode, "".join(stdout_chunks).strip(), "".join(stderr_chunks).strip()
 
 
 # ─────────────────────────────────────────────
@@ -578,6 +629,10 @@ def list_changed_files(repo_path: str) -> list[str]:
             files.append(path)
     return files
 
+def list_staged_files(repo_path: str) -> list[str]:
+    output = run_git(repo_path, ["diff", "--cached", "--name-only"])
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
 def classify_change_group(path: str) -> str:
     p = path.replace("\\", "/").lower()
     base = os.path.basename(p)
@@ -627,6 +682,194 @@ def build_explain_user_prompt(diff_text: str, changed_files: list[str]) -> str:
         f"{diff_text}\n"
     )
 
+def get_current_branch(repo_path: str) -> str:
+    return run_git(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
+
+def build_push_fallback_diagnosis(remote: str, branch: str) -> str:
+    return (
+        "Why It Failed:\n"
+        "- Push failed, but dynamic diagnosis is unavailable right now.\n\n"
+        "Most Likely Fix:\n"
+        "- Inspect branch tracking and reconcile local and remote history.\n\n"
+        "Commands To Run:\n"
+        "- git status\n"
+        "- git branch -vv\n"
+        f"- git fetch {remote}\n"
+        f"- git pull --rebase {remote} {branch}\n"
+        f"- git push {remote} {branch}\n\n"
+        "Safety Notes:\n"
+        "- Review any conflict resolutions before continuing."
+    )
+
+def normalize_plain_diagnosis(text: str) -> str:
+    """
+    Enforce plain terminal output if model returns markdown.
+    """
+    if not text:
+        return ""
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            lines.append("")
+            continue
+        if line.startswith("```"):
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            continue
+        line = re.sub(r"^#+\s*", "", line)
+        line = re.sub(r"^\*\*(.+)\*\*$", r"\1", line)
+        line = re.sub(r"^[\-\*\u2022]\s*", "", line)
+        lines.append(line)
+
+    # Collapse excessive blank lines.
+    normalized = []
+    blank = False
+    for line in lines:
+        if line == "":
+            if blank:
+                continue
+            blank = True
+            normalized.append(line)
+        else:
+            blank = False
+            normalized.append(line)
+    return "\n".join(normalized).strip()
+
+def diagnosis_is_clear(dynamic_context: str) -> bool:
+    """
+    Detect if git evidence is decisive enough for concise mode.
+    """
+    m = re.search(r"git rev-list --left-right --count HEAD\.\.\.[^\n`]+`?:\n([0-9]+)\s+([0-9]+)", dynamic_context)
+    if not m:
+        return False
+    ahead = int(m.group(1))
+    behind = int(m.group(2))
+    # Any non-equal state is already enough for direct, concise guidance.
+    return (ahead == 0 and behind > 0) or (ahead > 0 and behind == 0) or (ahead > 0 and behind > 0)
+
+def trim_diagnosis_for_clarity(text: str, concise: bool) -> str:
+    if not concise or not text:
+        return text
+
+    # Keep sections but trim verbose paragraphs to first 2 non-empty lines each.
+    headers = ["Why It Failed", "Most Likely Fix", "Commands To Run", "Safety Notes"]
+    sections = {h: [] for h in headers}
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        matched = next((h for h in headers if stripped.lower() == h.lower()), None)
+        if matched:
+            current = matched
+            sections[current].append(matched)
+            continue
+        if current:
+            sections[current].append(line)
+
+    out_lines = []
+    for h in headers:
+        block = sections[h]
+        if not block:
+            continue
+        out_lines.append(h)
+        kept = []
+        non_empty = 0
+        for line in block[1:]:
+            s = line.strip()
+            if h == "Commands To Run":
+                # Keep all command lines in concise mode.
+                if s:
+                    kept.append(s)
+                continue
+            if not s:
+                continue
+            kept.append(s)
+            non_empty += 1
+            if non_empty >= 2:
+                break
+        out_lines.extend(kept)
+        out_lines.append("")
+    return "\n".join(out_lines).strip()
+
+def collect_push_diagnosis_context(repo_path: str, remote: str, branch: str) -> str:
+    snippets = []
+    snippets.append(f"Repo path: {repo_path}")
+    snippets.append(f"Remote: {remote}")
+    snippets.append(f"Branch: {branch}")
+
+    def try_git_live(args: list[str], label: str):
+        cmd_display = "git " + " ".join(args)
+        click.echo(click.style(f"  [diagnose] Running: {cmd_display}", fg="bright_black"))
+        code, out, err = run_command_live(["git", *args], cwd=repo_path)
+        combined = "\n".join(part for part in [out, err] if part).strip()
+        if code == 0:
+            snippets.append(f"{label}:\n{combined or '(empty)'}")
+        else:
+            snippets.append(f"{label}:\n(command failed, exit={code})\n{combined or '(no output)'}")
+
+    # Gather fresh remote state for factual diagnosis.
+    try_git_live(["fetch", remote, branch], f"`git fetch {remote} {branch}`")
+    try_git_live(["status", "--short", "--branch"], "`git status --short --branch`")
+    try_git_live(["branch", "-vv"], "`git branch -vv`")
+    try_git_live(["remote", "-v"], "`git remote -v`")
+    try_git_live(["rev-list", "--left-right", "--count", f"HEAD...{remote}/{branch}"], f"`git rev-list --left-right --count HEAD...{remote}/{branch}`")
+    try_git_live(["merge-base", "HEAD", f"{remote}/{branch}"], f"`git merge-base HEAD {remote}/{branch}`")
+    try_git_live(["log", "--oneline", "-10", "HEAD"], "`git log --oneline -10 HEAD`")
+    try_git_live(["log", "--oneline", "-10", f"{remote}/{branch}"], f"`git log --oneline -10 {remote}/{branch}`")
+
+    return "\n\n".join(snippets)
+
+def build_push_failure_user_prompt(
+    repo_path: str,
+    remote: str,
+    branch: str,
+    error_text: str,
+    dynamic_context: str,
+    concise_mode: bool,
+) -> str:
+    return (
+        "Diagnose this failed git push.\n\n"
+        f"Target remote: {remote}\n"
+        f"Target branch: {branch}\n\n"
+        f"Diagnosis mode: {'concise' if concise_mode else 'detailed'}\n\n"
+        "Git error output:\n"
+        f"{error_text}\n\n"
+        "Repository evidence collected live:\n"
+        f"{dynamic_context}\n\n"
+        "Task:\n"
+        "- Diagnose dynamically from this exact failure and evidence.\n"
+        "- Explicitly use ahead/behind, merge-base, and recent commit logs when present.\n"
+        "- Prefer safest non-destructive fix first.\n"
+        "- Provide optional destructive fix only as a secondary option.\n"
+        "- Commands must be PowerShell-ready.\n"
+        "- If diagnosis mode is concise, keep each section short and avoid long explanations.\n"
+    )
+
+def diagnose_push_failure(repo_path: str, remote: str, branch: str, error_text: str) -> str:
+    fallback = build_push_fallback_diagnosis(remote, branch)
+    config = load_config()
+    if not config.get("provider"):
+        return fallback
+
+    try:
+        with loading_spinner("Collecting git evidence"):
+            dynamic_context = collect_push_diagnosis_context(repo_path, remote, branch)
+        concise_mode = diagnosis_is_clear(dynamic_context)
+        llm_prompt = build_push_failure_user_prompt(
+            repo_path,
+            remote,
+            branch,
+            error_text,
+            dynamic_context,
+            concise_mode,
+        )
+        with loading_spinner("Analyzing push failure"):
+            diagnosis = llm_generate_text(PUSH_FAILURE_SYSTEM_PROMPT, llm_prompt, config=config, temperature=0.1)
+            diagnosis = normalize_plain_diagnosis(diagnosis)
+            return trim_diagnosis_for_clarity(diagnosis, concise=concise_mode) or fallback
+    except Exception:
+        return fallback
+
 
 # ─────────────────────────────────────────────
 # MCP Core Logic
@@ -655,6 +898,19 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int,
                             click.echo(click.style(f"      ... +{len(files)-5} more", fg="bright_black"))
 
                 if click.confirm(click.style(f"\nCreate {len(groups)} commits from these groups?", fg="yellow"), default=True):
+                    staged_before = list_staged_files(repo_path)
+                    if staged_before:
+                        click.echo(click.style(
+                            f"⚠️  Found {len(staged_before)} pre-staged file(s). Smart staging will unstage them first.",
+                            fg="yellow",
+                        ))
+                        if not click.confirm(click.style("Proceed and reset index (keeps working tree changes)?", fg="yellow"), default=True):
+                            click.echo(click.style("❌ Aborted by user.", fg="red"))
+                            return
+
+                    # Ensure staged index starts clean so each group commit is isolated.
+                    run_git(repo_path, ["reset"])
+
                     for group_name, files in groups.items():
                         group_diff = build_files_diff(repo_path, files)
                         if not group_diff.strip():
@@ -684,9 +940,11 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int,
                         ))
                         if not click.confirm(click.style("Commit this group now?", fg="yellow"), default=True):
                             click.echo(click.style("   Skipped group.", fg="yellow"))
+                            run_git(repo_path, ["reset"])
                             continue
 
-                        run_git(repo_path, ["add", "--", *files])
+                        run_git(repo_path, ["reset"])
+                        run_git(repo_path, ["add", "-A", "--", *files])
                         commit_output = run_git(repo_path, ["commit", "-m", commit_message]).strip()
                         click.echo(click.style(f"   {commit_output}", fg="green"))
 
@@ -836,7 +1094,11 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int,
 # ─────────────────────────────────────────────
 
 @click.group()
-@click.version_option(version="0.1.2", prog_name="agent-gitv1")
+@click.version_option(
+    version="0.1.3",
+    prog_name="agent-gitv1",
+    message="%(prog)s %(version)s | Author: Vijayyyy-01",
+)
 def cli():
     """
     agent-gitv1: MCP + Multi-LLM Git Assistant
@@ -1038,14 +1300,22 @@ def push_command(remote: str, branch: str, repo: str):
     cmd = ["git", "push", remote]
     if branch:
         cmd.append(branch)
+    try:
+        target_branch = branch or get_current_branch(repo_path)
+    except Exception:
+        target_branch = branch or "(current)"
 
     try:
-        # We run it directly so SSH / password prompts work nicely in the terminal
-        result = subprocess.run(cmd, cwd=repo_path)
-        if result.returncode == 0:
+        click.echo(click.style(f"Running: {' '.join(cmd)}", fg="bright_black"))
+        returncode, stdout, stderr = run_command_live(cmd, cwd=repo_path)
+
+        if returncode == 0:
             click.echo(click.style("\n✅ Push complete!", fg="bright_green", bold=True))
         else:
-            sys.exit(result.returncode)
+            diagnosis = diagnose_push_failure(repo_path, remote, target_branch, f"{stdout}\n{stderr}".strip())
+            click.echo(click.style("\n🩺 Push Failure Diagnosis", fg="yellow", bold=True))
+            click.echo(diagnosis.strip())
+            sys.exit(returncode)
     except KeyboardInterrupt:
         click.echo(click.style("\n⚡ Interrupted.", fg="yellow"))
     except Exception as e:
