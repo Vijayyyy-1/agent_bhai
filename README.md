@@ -1,11 +1,15 @@
 # agent-gitv1
 
-AI-powered Git CLI for commit workflows using MCP plus your chosen LLM provider.
+AI-powered Git CLI for commit, push, explain, and pull-request workflows using MCP + LLMs.
 
-Supported providers:
+## What It Does
+
+`agent-gitv1` helps developers move faster in git workflows by generating commit messages, explaining large diffs, diagnosing push failures, and drafting PR titles/descriptions.
+
+Supported LLM providers:
 - Google Gemini
 - OpenAI
-- Ollama (local or same-network)
+- Ollama (local or same network)
 
 ## Quick Start
 
@@ -15,70 +19,69 @@ Supported providers:
 pip install agent-gitv1
 ```
 
-2. Configure provider/model:
+2. Configure your provider:
 
 ```bash
 agent config
 ```
 
-3. Use it in any git repository:
+3. Run in any git repo:
 
 ```bash
 agent commit
 agent explain
+agent pr
 agent push
 ```
 
-## Features
+## Key Features
 
-- Provider setup with `agent config`
-- Smart staging with auto-grouping (UI/backend/config/etc.)
-- Multi-suggestion commit messages (`--suggestions`)
-- Repo-aware commit style learning (recent commits)
-- `agent explain` for change summary, intent, and risk areas
-- Ollama local-network detection (same `/24`, port `11434`)
-- Loading/thinking spinner during long-running tasks
-- `agent push` with live command output streaming
-- LLM-driven push-failure diagnosis with adaptive live git evidence collection
+- AI-assisted commit messages with multiple suggestions
+- Smart staging mode that can split work into logical commit groups
+- Repository-aware commit style adaptation from recent commit history
+- `agent explain` for change intent, risk, and impacted files
+- `agent push` with live command output and LLM-driven failure diagnosis
+- Adaptive push diagnostics (light or full evidence collection)
+- Interactive PR drafting with remote detection and branch selection
+- Optional PR creation via GitHub CLI (`gh pr create`)
+- Ollama LAN auto-discovery (`/24` subnet on port `11434`)
 
 ## Requirements
 
 - Python 3.10+
 - Git
-- `uvx` (`pip install uv`)
-- Provider credentials (Gemini/OpenAI) or running Ollama server
+- `uvx` (install with `pip install uv`)
+- Provider credentials for Gemini/OpenAI, or a reachable Ollama instance
+- GitHub CLI (`gh`) if you want `agent pr --create`
 
-## Install
+## Installation
 
 ```bash
 pip install agent-gitv1
 ```
 
-Verify:
+Verify installation:
 
 ```bash
 agent --version
 agent --help
 ```
 
-## Configure
+## Configuration
 
 ```bash
 agent config
 ```
 
 Provider notes:
-- Gemini: set `GEMINI_API_KEY` or enter key in config
-- OpenAI: set `OPENAI_API_KEY` or enter key in config
-- Ollama: can auto-detect endpoints like `http://192.168.1.35:11434`
+- Gemini: uses `GEMINI_API_KEY` env var or key entered during config
+- OpenAI: uses `OPENAI_API_KEY` env var or key entered during config
+- Ollama: can auto-detect URLs such as `http://192.168.1.35:11434`
 
 ## Commands
 
-### `agent config`
-Configure LLM provider and model.
-
 ### `agent commit`
-Smart-stage changes, generate repo-aware suggestions, choose messages, and commit.
+Generate AI commit messages and commit changes.
 
 Examples:
 
@@ -90,12 +93,13 @@ agent commit --repo /path/to/repo
 agent commit --verbose
 ```
 
+Behavior highlights:
+- Uses MCP git diff for normal commit flow
+- Can auto-group changed files and create multiple commits
+- Adapts commit style to recent repository history
+
 ### `agent explain`
-Explain current uncommitted changes:
-- what changed
-- why it likely changed
-- risk areas
-- files impacted
+Explain current uncommitted changes in a developer-friendly format.
 
 Examples:
 
@@ -104,34 +108,72 @@ agent explain
 agent explain --repo /path/to/repo
 ```
 
+Output includes:
+- What changed
+- Why it likely changed
+- Risk areas
+- Files impacted
+
+### `agent pr`
+Generate PR title/body from commits + diff, then optionally create PR via GitHub CLI.
+
+Examples:
+
+```bash
+agent pr
+agent pr --create
+agent pr --draft --create
+agent pr --target-remote upstream
+agent pr --target-remote upstream --base develop --head feature/my-branch --create
+```
+
+Interactive flow (default):
+- Detect remotes (`origin`, `upstream`, etc.)
+- Let user choose PR target remote if multiple exist
+- Fetch and let user choose base branch
+- Compare ahead/behind status and warn if branch is behind target
+- Generate PR title and description with LLM
+- Optionally create PR with `gh pr create`
+
 ### `agent push`
-Push to remote with live output.
+Push current branch (or explicit branch) with live output.
 
 Examples:
 
 ```bash
 agent push
-agent push --remote origin --branch main
+agent push --branch main
+agent push --remote origin --branch feature/my-branch
 ```
 
-When `--branch` is omitted, `agent` auto-detects and pushes your current local branch name.
+Behavior highlights:
+- Auto-detects and pushes current local branch when `--branch` is omitted
+- If no upstream exists, offers `git push --set-upstream`
+- On failure, collects live git evidence and generates LLM diagnosis with fix commands
 
-If push fails, `agent` first uses the LLM to choose evidence depth, then runs diagnosis commands live.
-For divergence/history problems it collects full branch evidence (`fetch`, logs, ahead/behind, merge-base).
-For auth/permission issues it uses a lightweight evidence set to avoid noisy output.
-If the current branch has no upstream, `agent` offers to run `git push --set-upstream` automatically.
+### `agent config`
+Configure provider, model, and Ollama endpoint/model.
 
 ### `agent --help`
-Show all commands and options.
+List all commands and options.
 
 ## Environment Variables
 
 - `GEMINI_API_KEY`
 - `OPENAI_API_KEY`
 
-## Developer Setup (optional)
+## GitHub CLI Requirement for PR Creation
 
-Only for contributors working on this codebase:
+`agent pr --create` requires authenticated GitHub CLI.
+
+```bash
+gh auth status
+gh auth login
+```
+
+## Developer Setup (Optional)
+
+Only if you are modifying this codebase locally:
 
 ```bash
 git clone <repo-url>
@@ -139,7 +181,7 @@ cd Agent_bhai
 pip install -e .
 ```
 
-## Publish to PyPI
+## Build and Publish (PyPI)
 
 ```bash
 python -m pip install --upgrade build twine

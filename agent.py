@@ -93,6 +93,23 @@ Use LIGHT for auth/permission/token/network/remote-url issues where heavy histor
 No extra text.
 """
 
+PR_SYSTEM_PROMPT = """
+You are a senior engineer writing GitHub pull requests.
+Generate:
+1) A concise, specific PR title.
+2) A clear PR description in markdown.
+
+Output format (plain text, exact):
+TITLE: <single line title>
+BODY:
+<markdown body>
+
+Requirements:
+- Base content on provided commit history and diff.
+- Include sections: Summary, Changes, Risks, Testing.
+- Be factual, avoid hype.
+"""
+
 COMMIT_TYPE_PATTERN = r"(?:feat|fix|docs|style|refactor|test|chore|ci|perf)"
 COMMIT_MESSAGE_PATTERN = re.compile(
     rf"^{COMMIT_TYPE_PATTERN}(?:\([^)]+\))?: .+"
@@ -697,6 +714,83 @@ def build_explain_user_prompt(diff_text: str, changed_files: list[str]) -> str:
         f"{diff_text}\n"
     )
 
+def detect_default_base_branch(repo_path: str) -> str:
+    try:
+        ref = run_git(repo_path, ["symbolic-ref", "refs/remotes/origin/HEAD"]).strip()
+        if ref.startswith("refs/remotes/origin/"):
+            return ref.split("/")[-1]
+    except Exception:
+        pass
+    try:
+        branches = run_git(repo_path, ["branch", "--list", "main", "master"]).strip().splitlines()
+        cleaned = [b.replace("*", "").strip() for b in branches if b.strip()]
+        if "main" in cleaned:
+            return "main"
+        if "master" in cleaned:
+            return "master"
+    except Exception:
+        pass
+    return "main"
+
+def get_commit_range_log(repo_path: str, base: str, head: str, max_commits: int = 30) -> str:
+    try:
+        out = run_git(repo_path, ["log", "--oneline", f"-n{max_commits}", f"{base}..{head}"]).strip()
+        return out or "(no commits in range)"
+    except Exception as e:
+        return f"(unable to load commits: {e})"
+
+def parse_pr_draft(text: str) -> tuple[str, str]:
+    raw = (text or "").strip()
+    if not raw:
+        return "chore: update changes", "Summary\n- Update changes\n"
+
+    title = ""
+    body = ""
+    m = re.search(r"^\s*TITLE:\s*(.+)$", raw, flags=re.IGNORECASE | re.MULTILINE)
+    if m:
+        title = m.group(1).strip()
+
+    bm = re.search(r"^\s*BODY:\s*$", raw, flags=re.IGNORECASE | re.MULTILINE)
+    if bm:
+        body = raw[bm.end():].strip()
+
+    if not title:
+        first = raw.splitlines()[0].strip()
+        title = re.sub(r"^\s*(TITLE:\s*)", "", first, flags=re.IGNORECASE).strip() or "chore: update changes"
+    if not body:
+        body = "Summary\n- Update changes\n"
+    return title, body
+
+def build_pr_user_prompt(base: str, head: str, commits_text: str, diff_text: str) -> str:
+    return (
+        f"Create a PR draft from branch `{head}` into `{base}`.\n\n"
+        "Commits in range:\n"
+        f"{commits_text}\n\n"
+        "Diff:\n"
+        f"{diff_text}\n"
+    )
+
+async def fetch_branch_diff_via_mcp(repo_path: str, base_branch: str) -> str:
+    server_params = StdioServerParameters(
+        command="uvx",
+        args=["mcp-server-git", "--repository", repo_path],
+        env=None,
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "git_diff",
+                arguments={
+                    "repo_path": repo_path,
+                    "target": base_branch,
+                },
+            )
+            diff_text = extract_tool_text(result)
+            if getattr(result, "isError", False):
+                raise click.ClickException(f"git_diff failed for base '{base_branch}': {diff_text or 'Unknown MCP tool error.'}")
+            return diff_text
+
 def get_current_branch(repo_path: str) -> str:
     return run_git(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
 
@@ -1152,7 +1246,7 @@ async def run_agent_commit(repo_path: str, verbose: bool, suggestion_count: int,
 
 @click.group()
 @click.version_option(
-    version="0.1.3",
+    version="0.1.5",
     prog_name="agent-gitv1",
     message="%(prog)s %(version)s | Author: Vijayyyy-01",
 )
@@ -1167,6 +1261,7 @@ def cli():
       config  Configure AI provider and model
       commit  Smart-stage changes and create AI-assisted commit(s)
       explain Explain what changed, why, risks, and impacted files
+      pr      Generate PR title/description and create PR via gh
       push    Push committed changes to remote
 
     Run `agent <command> --help` for command-specific options.
@@ -1325,6 +1420,303 @@ def explain_command(repo: str, verbose: bool):
 
     click.echo(click.style("\n📘 Change Explanation", fg="green", bold=True))
     click.echo(explanation.strip() or "No explanation generated.")
+
+def get_all_remotes(repo_path: str) -> dict[str, str]:
+    """Return a mapping of {remote_name: fetch_url} from `git remote -v`."""
+    try:
+        output = run_git(repo_path, ["remote", "-v"])
+    except Exception:
+        return {}
+    remotes: dict[str, str] = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or not line.endswith("(fetch)"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            remotes[parts[0]] = parts[1]
+    return remotes
+
+
+def get_remote_branches(repo_path: str, remote: str) -> list[str]:
+    """Silently fetch <remote> then return a sorted list of its branch names."""
+    try:
+        subprocess.run(
+            ["git", "fetch", remote],
+            cwd=repo_path,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+    try:
+        output = run_git(repo_path, ["branch", "-r"])
+    except Exception:
+        return []
+    prefix = f"{remote}/"
+    branches: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        name = stripped[len(prefix):]
+        if "->" in name:
+            continue
+        if name and name not in branches:
+            branches.append(name)
+    return sorted(branches)
+
+
+def get_ahead_behind(
+    repo_path: str, remote: str, base_branch: str, head_branch: str
+) -> tuple[int, int]:
+    """
+    Return (ahead, behind) of head_branch relative to remote/base_branch.
+
+    ahead  = commits in head_branch not in remote/base_branch
+    behind = commits in remote/base_branch not in head_branch
+    Returns (0, 0) on any failure.
+    """
+    try:
+        subprocess.run(
+            ["git", "fetch", remote],
+            cwd=repo_path,
+            capture_output=True,
+        )
+        output = run_git(
+            repo_path,
+            ["rev-list", "--left-right", "--count", f"{remote}/{base_branch}...{head_branch}"],
+        ).strip()
+        parts = output.split()
+        if len(parts) == 2:
+            behind = int(parts[0])
+            ahead = int(parts[1])
+            return ahead, behind
+    except Exception:
+        pass
+    return 0, 0
+
+
+def parse_github_owner_repo(remote_url: str) -> str | None:
+    """
+    Parse 'owner/repo' from a GitHub remote URL.
+
+    Handles HTTPS (https://github.com/owner/repo.git) and
+    SSH (git@github.com:owner/repo.git) formats.
+    Returns None if the URL is not a recognised GitHub URL.
+    """
+    url = remote_url.strip()
+    m = re.match(r"https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", url)
+    if m:
+        return m.group(1)
+    m = re.match(r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def select_target_remote(remotes: dict[str, str]) -> str:
+    """
+    Prompt the user to pick a target remote from the available list.
+
+    Returns immediately when only one remote exists.
+    Highlights 'upstream' as the suggested choice when present.
+    """
+    names = list(remotes.keys())
+    if len(names) == 1:
+        return names[0]
+    suggested_idx: int | None = None
+    click.echo(click.style("\nAvailable remotes:", fg="cyan"))
+    for idx, name in enumerate(names, start=1):
+        url = remotes[name]
+        label = ""
+        if name == "upstream":
+            label = click.style("  ← suggested (fork upstream)", fg="yellow")
+            suggested_idx = idx
+        click.echo(f"  {idx}. {click.style(name, fg='bright_white')}  {url}{label}")
+    default_choice = str(suggested_idx) if suggested_idx else "1"
+    raw = click.prompt(
+        click.style("Select target remote by number", fg="yellow"),
+        default=default_choice,
+        type=str,
+    ).strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(names):
+        return names[int(raw) - 1]
+    if raw in remotes:
+        return raw
+    return names[0]
+
+
+def select_base_branch(branches: list[str], remote: str) -> str:
+    """
+    Prompt the user to pick a base branch from <remote>.
+
+    Returns immediately when only one branch exists.
+    Highlights common default branch names (main, master, develop, dev).
+    """
+    if len(branches) == 1:
+        return branches[0]
+    preferred = [b for b in ("main", "master", "develop", "dev") if b in branches]
+    click.echo(click.style(f"\nBranches on {remote}:", fg="cyan"))
+    for idx, name in enumerate(branches, start=1):
+        label = click.style("  ← suggested", fg="yellow") if name in preferred else ""
+        click.echo(f"  {idx}. {click.style(name, fg='bright_white')}{label}")
+    default_choice = str(branches.index(preferred[0]) + 1) if preferred else "1"
+    raw = click.prompt(
+        click.style("Select base branch by number", fg="yellow"),
+        default=default_choice,
+        type=str,
+    ).strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(branches):
+        return branches[int(raw) - 1]
+    if raw in branches:
+        return raw
+    return preferred[0] if preferred else branches[0]
+
+
+@cli.command("pr")
+@click.option("--repo", "-r", default=".", show_default=True, help="Path to the git repository.")
+@click.option("--base", default=None, help="Base branch (skips interactive selection).")
+@click.option("--head", default=None, help="Head branch (default: current branch).")
+@click.option("--target-remote", default=None, help="Target remote for PR (skips interactive selection).")
+@click.option("--create/--no-create", default=False, show_default=True, help="Create PR using GitHub CLI after generating draft.")
+@click.option("--draft", is_flag=True, default=False, help="Create as draft PR (used with --create).")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Show extra debug information.")
+def pr_command(
+    repo: str,
+    base: str | None,
+    head: str | None,
+    target_remote: str | None,
+    create: bool,
+    draft: bool,
+    verbose: bool,
+):
+    """Generate PR title/body from commits + diff, optionally create PR with gh."""
+    # STEP 1 – Validate repo path
+    repo_path = os.path.abspath(repo)
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        raise click.ClickException(f"'{repo_path}' is not a valid git repository (no .git folder found).")
+
+    # STEP 2 – Detect head branch
+    head_branch = head or get_current_branch(repo_path)
+    click.echo(click.style(f"\n🗂  Repository: {repo_path}", fg="bright_cyan", bold=True))
+
+    # STEP 3 – Detect all remotes
+    remotes = get_all_remotes(repo_path)
+    if not remotes:
+        raise click.ClickException(
+            "No git remotes configured. Add one with:\n"
+            "  git remote add origin https://github.com/owner/repo.git"
+        )
+
+    # STEP 4 – Select target remote
+    if target_remote:
+        if target_remote not in remotes:
+            raise click.ClickException(
+                f"Remote '{target_remote}' not found. Available remotes: {', '.join(remotes)}."
+            )
+    else:
+        target_remote = select_target_remote(remotes)
+    click.echo(click.style(f"🎯 Target remote: {target_remote}  ({remotes[target_remote]})", fg="cyan"))
+
+    # STEP 5 – Select base branch
+    if base:
+        base_branch = base
+    else:
+        branches = get_remote_branches(repo_path, target_remote)
+        if not branches:
+            base_branch = detect_default_base_branch(repo_path)
+            click.echo(click.style(
+                f"ℹ️  Could not list branches on {target_remote}, falling back to '{base_branch}'.",
+                fg="yellow",
+            ))
+        else:
+            base_branch = select_base_branch(branches, target_remote)
+
+    if head_branch == base_branch and target_remote == "origin":
+        raise click.ClickException("Head and base branches are the same. Choose a different --base or --head.")
+    click.echo(click.style(f"🔀 PR target: {head_branch} → {target_remote}/{base_branch}", fg="cyan"))
+
+    # STEP 6 – Sync check
+    ahead, behind = get_ahead_behind(repo_path, target_remote, base_branch, head_branch)
+    if behind > 0:
+        click.echo(click.style(
+            f"\n⚠  Your branch is {behind} commit(s) behind {target_remote}/{base_branch}.",
+            fg="yellow",
+        ))
+        click.echo(click.style(
+            f"   Suggested fix: git fetch {target_remote} && git rebase {target_remote}/{base_branch}",
+            fg="bright_black",
+        ))
+        if not click.confirm(click.style("Continue anyway?", fg="yellow"), default=False):
+            raise SystemExit(0)
+
+    # STEP 7 – Build gh pr create command
+    owner_repo = parse_github_owner_repo(remotes[target_remote])
+    if target_remote != "origin" and "origin" in remotes:
+        # Fork scenario: gh needs owner:branch for --head
+        origin_owner_repo = parse_github_owner_repo(remotes["origin"])
+        if origin_owner_repo:
+            fork_owner = origin_owner_repo.split("/")[0]
+            gh_head = f"{fork_owner}:{head_branch}"
+        else:
+            gh_head = head_branch
+    else:
+        gh_head = head_branch
+
+    # STEP 8 – Collect diff and generate PR
+    remote_base = f"{target_remote}/{base_branch}" if target_remote != "origin" else base_branch
+
+    commits_text = get_commit_range_log(repo_path, remote_base, head_branch, max_commits=30)
+    if verbose:
+        click.echo(click.style("\n── Commit Range ──", fg="bright_black"))
+        click.echo(click.style(commits_text, fg="bright_black"))
+
+    with loading_spinner("Fetching branch diff via MCP"):
+        try:
+            diff_text = asyncio.run(fetch_branch_diff_via_mcp(repo_path, base_branch))
+            if not diff_text.strip():
+                raise ValueError("MCP returned empty diff")
+        except Exception:
+            diff_text = run_git(repo_path, ["diff", f"{remote_base}...{head_branch}"])
+
+    if not diff_text.strip():
+        raise click.ClickException(f"No diff found between {remote_base} and {head_branch}.")
+
+    llm_diff_payload, was_truncated = build_llm_diff_payload(diff_text)
+    if was_truncated and verbose:
+        click.echo(click.style(
+            f"   Large diff detected. Using compact payload ({len(llm_diff_payload)} chars).",
+            fg="yellow",
+        ))
+
+    config = load_config()
+    prompt = build_pr_user_prompt(base_branch, head_branch, commits_text, llm_diff_payload)
+    with loading_spinner("Generating PR draft"):
+        draft_text = llm_generate_text(PR_SYSTEM_PROMPT, prompt, config=config, temperature=0.2)
+    pr_title, pr_body = parse_pr_draft(draft_text)
+
+    # STEP 9 – Show preview
+    click.echo(click.style("\n📝 PR Title", fg="green", bold=True))
+    click.echo(pr_title)
+    click.echo(click.style("\n📝 PR Description", fg="green", bold=True))
+    click.echo(pr_body)
+
+    # STEP 10 – Confirm and create
+    if not create:
+        if not click.confirm(click.style("\nCreate this PR with gh now?", fg="yellow"), default=False):
+            return
+
+    cmd = ["gh", "pr", "create", "--base", base_branch, "--head", gh_head, "--title", pr_title, "--body", pr_body]
+    if owner_repo:
+        cmd += ["--repo", owner_repo]
+    if draft:
+        cmd.append("--draft")
+
+    click.echo(click.style(f"\nRunning: {' '.join(cmd)}", fg="bright_black"))
+    code, _, _ = run_command_live(cmd, cwd=repo_path)
+    if code != 0:
+        raise click.ClickException("Failed to create PR via gh. Ensure GitHub CLI is installed and authenticated (`gh auth status`).")
+    click.echo(click.style("\n✅ PR created successfully!", fg="bright_green", bold=True))
 
 
 @cli.command("push")
